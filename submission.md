@@ -63,7 +63,7 @@ cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsec
 Before the cutoff was a rolling window. This means we want it to mean midnight today, so anything before that, even if it is less than 24 hour old...gets excluded. 
 
 
-# Bug 3: The same song keeps showing up twice in search
+# Bug #3: The same song keeps showing up twice in search
 
 I ran:
 source .venv/bin/activate && python -c "
@@ -108,3 +108,29 @@ results = (
     .distinct()
     .all()
 )
+
+
+# Bug #4: I got notified when a friend added my song to a playlist but not when they rated it 
+
+I ran:
+source .venv/bin/activate && python -c "
+from app import create_app
+from services.notification_service import rate_song, get_notifications
+from models import Song, User
+
+app = create_app()
+with app.app_context():
+    song = Song.query.first()
+    rater = User.query.filter(User.id != song.shared_by).first()
+
+    print('song:', song.title, '| shared_by:', song.shared_by)
+    print('rater:', rater.username, rater.id)
+
+    rating = rate_song(rater.id, song.id, 5)
+    print('rating created:', rating.to_dict())
+
+    notifications = get_notifications(song.shared_by)
+    print('sharer notifications:', notifications)
+"
+
+I noticed no one was rating songs. I changed the user and still no one rating songs. I checked notification_service.py and realized that create_notification was not being called inside of rate_song. I got that implemented to fix the bug. 
