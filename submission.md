@@ -1,4 +1,11 @@
-Codebase Map
+# AI usage section
+AI (Claude) was used to:
+- Create commands to run tests
+- Check my work and add information if I missed it inside this document.
+- Write Pytests
+- Confirm if bugs are fixed. 
+
+# Codebase Map
 
 models.py defines 7 SQLAlchemy models: User, Tag, Song, ListeningEvent, Rating, Playlist, and Notification. Song-to-playlist membership isn't a model at all — it's a plain association table, playlist_entries, with extra columns (position, added_by, added_at) beyond the two foreign keys. Similarly, friendships (User-to-User) and song_tags (Song-to-Tag) are association tables, not models.
 
@@ -22,3 +29,115 @@ Data flow — user views a playlist: GET /playlists/<id>/songs in routes/playlis
 Data flow — a song gets into a friend's feed: there's no explicit "add to feed" step. POST /songs/<id>/listen calls streak_service.record_listening_event(), which just inserts a ListeningEvent row. Later, GET /feed/<id>/listening-now calls feed_service.get_friends_listening_now(), which queries those same ListeningEvent rows for the user's friends. The feed is entirely derived at read time from listening history — there's no separate feed table.
 
 Pattern I noticed: every route delegates immediately to a service function. The routes do input parsing and response formatting; all business logic lives in services/. A second pattern: services never validate cross-cutting concerns themselves (e.g. friendship checks) — feed_service filters by user.friends directly in each query rather than through a shared helper, which is worth watching for duplicated/inconsistent logic across get_friends_listening_now() and get_activity_feed().
+
+# Reproducing Bugs:
+
+## Bug #2: Friends Listening Now shows people from yesterday
+I ran:
+source .venv/bin/activate && python -c "
+from app import create_app, db
+from models import User, ListeningEvent, Song
+from datetime import datetime, timezone, timedelta
+
+app = create_app()
+with app.app_context():
+    aaliya = User.query.filter_by(username='aaliya').first()
+    song = Song.query.first()
+
+    today_midnight = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_2350 = today_midnight - timedelta(minutes=10)
+
+    event = ListeningEvent(user_id=aaliya.id, song_id=song.id, listened_at=yesterday_2350)
+    db.session.add(event)
+    db.session.commit()
+
+    print('aaliya id:', aaliya.id)
+    print('kenji id:', User.query.filter_by(username=\"kenji\").first().id)
+    print('inserted listened_at:', yesterday_2350, '(calendar date: yesterday)')
+    print('age in hours:', (datetime.now(timezone.utc) - yesterday_2350).total_seconds() / 3600)
+"
+
+Then I ran: curl -s http://127.0.0.1:5000/feed/73daacee-8381-4a8b-bcd5-61f9f5ebc19f/listening-now | python -m json.tool
+ because Kenji is Aaliya's friend. I discovered that feed_service.get_friends_listening_now() uses a flat rolling window 
+ This only checks "is it less than 24 hours old," not "did this happen today." An event from 23:50 last night is ~5 hours old (well under 24h), so it passes the filter — but it's from a different calendar date, which is exactly the reported symptom: "Friends Listening Now shows people from yesterday."
+
+This is inconsistent with how streak_service.py handles the same kind of problem — it explicitly compares .date() values (calendar days) rather than raw hour deltas. feed_service.py should likely do the same: filter by "listened today" (i.e. listened_at.date() == today) rather than "listened within the last 24 hours."
+
+To fix the error I removed the line that says:
+RECENT_THRESHOLD = timedelta(hours=24)
+Then I changed the cutoff to be:   
+cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+Before the cutoff was a rolling window. This means we want it to mean midnight today, so anything before that, even if it is less than 24 hour old...gets excluded. 
+
+
+# Bug #3: The same song keeps showing up twice in search
+
+I ran:
+source .venv/bin/activate && python -c "
+from app import create_app, db
+from models import Song, song_tags
+
+app = create_app()
+with app.app_context():
+    stmt = (
+        db.session.query(Song.id, Song.title)
+        .outerjoin(song_tags, Song.id == song_tags.c.song_id)
+        .filter(Song.title.ilike('%Crown Heights%'))
+        .statement
+    )
+    raw_rows = db.session.execute(stmt).fetchall()
+    for row in raw_rows:
+        print(row)
+    print('raw row count:', len(raw_rows))
+"
+
+This queries the exact same join search_songs() uses in services/search_service.py, but selects raw columns (Song.id, Song.title) instead of the full Song entity. The result was:
+('d2386bfc-2fc7-4cee-b323-596504383fdf', 'Crown Heights Anthem')
+('d2386bfc-2fc7-4cee-b323-596504383fdf', 'Crown Heights Anthem')
+('d2386bfc-2fc7-4cee-b323-596504383fdf', 'Crown Heights Anthem')
+raw row count: 3
+
+"Crown Heights Anthem" has 3 tags (rap, hip-hop, boom bap) in song_tags. The outerjoin in search_songs() fans out one row per matching tag, so the raw SQL genuinely returns the same song 3 times — one row per tag row it joins against.
+
+Interestingly, calling search_songs('Crown Heights') directly (or hitting GET /songs/search?q=Crown, or running pytest tests/test_search.py) does NOT show this duplication — all come back with exactly 1 result. That's because search_songs() calls db.session.query(Song) — the legacy SQLAlchemy Query API — selecting only the full Song entity with no extra columns. That specific pattern silently deduplicates by primary key when materializing .all(), which is why the duplicate rows never reach the caller today. The bug is masked, not fixed: the query itself is still wrong (it's expressing "one row per matching song-tag pair," not "one row per matching song"), and it happens to come out right only because of an ORM implementation detail this code doesn't explicitly rely on.
+
+To fix it, I added .distinct() to the query in search_service.py so it explicitly returns one row per song regardless of ORM version/behavior:
+
+results = (
+    db.session.query(Song)
+    .outerjoin(song_tags, Song.id == song_tags.c.song_id)
+    .filter(
+        db.or_(
+            Song.title.ilike(f"%{query}%"),
+            Song.artist.ilike(f"%{query}%"),
+        )
+    )
+    .distinct()
+    .all()
+)
+
+
+# Bug #4: I got notified when a friend added my song to a playlist but not when they rated it 
+
+I ran:
+source .venv/bin/activate && python -c "
+from app import create_app
+from services.notification_service import rate_song, get_notifications
+from models import Song, User
+
+app = create_app()
+with app.app_context():
+    song = Song.query.first()
+    rater = User.query.filter(User.id != song.shared_by).first()
+
+    print('song:', song.title, '| shared_by:', song.shared_by)
+    print('rater:', rater.username, rater.id)
+
+    rating = rate_song(rater.id, song.id, 5)
+    print('rating created:', rating.to_dict())
+
+    notifications = get_notifications(song.shared_by)
+    print('sharer notifications:', notifications)
+"
+
+I noticed no one was rating songs. I changed the user and still no one rating songs. I checked notification_service.py and realized that create_notification was not being called inside of rate_song. I got that implemented to fix the bug. 
