@@ -1,3 +1,10 @@
+# AI usage section
+AI (Claude) was used to:
+- Create commands to run tests
+- Check my work and add information if I missed it inside this document.
+- Write Pytests
+- Confirm if bugs are fixed. 
+
 # Codebase Map
 
 models.py defines 7 SQLAlchemy models: User, Tag, Song, ListeningEvent, Rating, Playlist, and Notification. Song-to-playlist membership isn't a model at all — it's a plain association table, playlist_entries, with extra columns (position, added_by, added_at) beyond the two foreign keys. Similarly, friendships (User-to-User) and song_tags (Song-to-Tag) are association tables, not models.
