@@ -61,3 +61,50 @@ RECENT_THRESHOLD = timedelta(hours=24)
 Then I changed the cutoff to be:   
 cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 Before the cutoff was a rolling window. This means we want it to mean midnight today, so anything before that, even if it is less than 24 hour old...gets excluded. 
+
+
+# Bug 3: The same song keeps showing up twice in search
+
+I ran:
+source .venv/bin/activate && python -c "
+from app import create_app, db
+from models import Song, song_tags
+
+app = create_app()
+with app.app_context():
+    stmt = (
+        db.session.query(Song.id, Song.title)
+        .outerjoin(song_tags, Song.id == song_tags.c.song_id)
+        .filter(Song.title.ilike('%Crown Heights%'))
+        .statement
+    )
+    raw_rows = db.session.execute(stmt).fetchall()
+    for row in raw_rows:
+        print(row)
+    print('raw row count:', len(raw_rows))
+"
+
+This queries the exact same join search_songs() uses in services/search_service.py, but selects raw columns (Song.id, Song.title) instead of the full Song entity. The result was:
+('d2386bfc-2fc7-4cee-b323-596504383fdf', 'Crown Heights Anthem')
+('d2386bfc-2fc7-4cee-b323-596504383fdf', 'Crown Heights Anthem')
+('d2386bfc-2fc7-4cee-b323-596504383fdf', 'Crown Heights Anthem')
+raw row count: 3
+
+"Crown Heights Anthem" has 3 tags (rap, hip-hop, boom bap) in song_tags. The outerjoin in search_songs() fans out one row per matching tag, so the raw SQL genuinely returns the same song 3 times — one row per tag row it joins against.
+
+Interestingly, calling search_songs('Crown Heights') directly (or hitting GET /songs/search?q=Crown, or running pytest tests/test_search.py) does NOT show this duplication — all come back with exactly 1 result. That's because search_songs() calls db.session.query(Song) — the legacy SQLAlchemy Query API — selecting only the full Song entity with no extra columns. That specific pattern silently deduplicates by primary key when materializing .all(), which is why the duplicate rows never reach the caller today. The bug is masked, not fixed: the query itself is still wrong (it's expressing "one row per matching song-tag pair," not "one row per matching song"), and it happens to come out right only because of an ORM implementation detail this code doesn't explicitly rely on.
+
+To fix it, I added .distinct() to the query in search_service.py so it explicitly returns one row per song regardless of ORM version/behavior:
+
+results = (
+    db.session.query(Song)
+    .outerjoin(song_tags, Song.id == song_tags.c.song_id)
+    .filter(
+        db.or_(
+            Song.title.ilike(f"%{query}%"),
+            Song.artist.ilike(f"%{query}%"),
+        )
+    )
+    .distinct()
+    .all()
+)
