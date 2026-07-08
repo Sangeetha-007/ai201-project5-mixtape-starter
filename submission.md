@@ -1,9 +1,10 @@
 # AI usage section
 AI (Claude) was used to:
-- Create commands to run tests
-- Check my work and add information if I missed it inside this document.
-- Write Pytests
-- Confirm if bugs are fixed. 
+- Help build and fact-check the codebase map, tracing how a request flows from a route through a service to the models.
+- Write one-off Python scripts and curl commands to call service functions and API endpoints directly, so bugs could be reproduced with real output instead of guessed from reading code.
+- Help interpret reproduction output to pin down each bug's root cause (e.g. rolling 24h window vs. calendar day in feed_service.py, a masked duplicate-row join in search_service.py, a missing create_notification() call in rate_song()).
+- Propose fixes for Bugs #2–#4, which I reviewed and applied myself, then re-ran the reproduction scripts to confirm each fix worked before committing.
+- Help write commit messages and debug shell issues (quoting, path placeholders) while testing.
 
 # Codebase Map
 
@@ -141,3 +142,24 @@ with app.app_context():
 "
 
 I noticed no one was rating songs. I changed the user and still no one rating songs. I checked notification_service.py and realized that create_notification was not being called inside of rate_song. I got that implemented to fix the bug. 
+
+# Side Effect Checks
+
+After fixing Bugs #2, #3, and #4, I ran the full test suite to check for regressions:
+
+source .venv/bin/activate && python -m pytest tests/ -v
+
+Result: 10 passed, 3 failed.
+- All of tests/test_search.py passed — confirms the .distinct() fix in search_service.py didn't break anything.
+- 4 of 5 tests in tests/test_streaks.py passed. The one failure, test_streak_increments_on_sunday, is Issue #1 (streak logic has a special-cased Sunday reset) — pre-existing, unrelated to my fixes, and not yet fixed.
+- Both tests in tests/test_playlists.py that check song count/order failed. This is Issue #5 (get_playlist_songs() drops the last song via songs[:-1]) — also pre-existing and not yet fixed.
+
+So the 3 failures map exactly to the two remaining open issues (#1 and #5), not to anything I changed. No regressions from my fixes.
+
+I also manually spot-checked the other function living in each file I edited, to make sure I didn't break a sibling function that shares the same module:
+
+- feed_service.py: get_friends_listening_now() was fixed for Bug #2, but get_activity_feed() (same file, deliberately unfiltered by design) still returns all events including stale ones, unchanged:
+  get_activity_feed(kenji.id) returned nova and aaliya's events including aaliya's stale 2026-07-06T23:50:00 event — correct, since this feed isn't supposed to filter by recency.
+
+- notification_service.py: rate_song() got a new create_notification() call for Bug #4, but add_to_playlist() (same file, pre-existing notification path) still fires correctly:
+  add_to_playlist() on a song with 0 existing notifications for its sharer resulted in 1 notification afterward, same as before my change.
